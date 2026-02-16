@@ -8,13 +8,16 @@
 clear; clc;
 
 P = 4; % Voxel pitch
-start_shift = [0,0]; % [dx,dy] voxel shift for initial footprint
+start_shift = [0,-1]; % [dx,dy] voxel shift for initial footprint
+model = struct('a1_scale',1.35,'a2_scale',0.5); % consistent geometry model
+hand_angle_param = []; % []=auto-safe, numeric(deg)=manual fixed hand angle
 
 addpath(genpath("stlTools"));
 bille = struct('a1',[],'a2',[],'state',[],'next_state',[],'curr_v',[],'next_v',[],...
     'path',[],'pth_ind',[],'new_pth',[],'change',[],'cost',[],'coord',[],'pose',[],...
     'pose_d',[],'th_h',[],'ths',[],'th_ind',[],'prev_ths',[],'stage',[],'anchor',[],...
-    'payload',[],'flag',[],'r_p',[],'r_v',[],'l_p',[],'l_v',[],'p_p',[],'foot_n',[]);
+    'payload',[],'flag',[],'r_p',[],'r_v',[],'l_p',[],'l_v',[],'p_p',[],...
+    'foot_n',[],'hand_pref',[],'hand_lock',[]);
 
 while(1)
     close all;
@@ -40,8 +43,8 @@ while(1)
     robot.foot_n = repmat([0,0,1],[2,1]);
     
     % Size of BillE. a1 is the longer segment, a2 is the shorter segment
-    robot.a1 = 1.2*P; 
-    robot.a2 = 0.5*P;
+    robot.a1 = model.a1_scale*P;
+    robot.a2 = model.a2_scale*P;
 
     % Starting location of the robot (back foot row 1, front foot row 2)
     start_base = [5,5;5,6];
@@ -53,11 +56,32 @@ while(1)
 
     % Angles for robot motion
     robot.ths = zeros(6,1,1); 
-    robot.ths(6) = 110;
+    robot.ths(6) = 70; % initial guess, refined below by collision check
     robot.th_ind = 1;
 
     % Bunch of variables for movement logic
     robot.payload = 1;
+    if(isempty(hand_angle_param))
+        hand_in = input("Payload hand angle override in deg (Enter=auto): ","s");
+    else
+        hand_in = num2str(hand_angle_param);
+        fprintf("Payload hand angle override from parameter: %s deg\n",hand_in);
+    end
+    [has_hand_override,hand_override] = parseOptionalHandAngle(hand_in);
+    if(has_hand_override)
+        robot.hand_lock = true;
+        robot.hand_pref = hand_override;
+        robot.ths(6) = hand_override;
+        init_msg = sprintf("Initial payload angle set by user to %.1f deg.",hand_override);
+    else
+        robot.hand_lock = false;
+        [robot,init_msg] = setInitialPayloadHandSafe(P,map,robot,...
+            [20,0,-20,-40,-60,-80,40,55,70,90,110,130,150]);
+        robot.hand_pref = robot.ths(6);
+    end
+    if(strlength(init_msg)>0)
+        disp(init_msg);
+    end
     robot = drawRobot(P,robot);
     if(robot.payload) 
         robot = drawLoad(P,robot);
@@ -421,102 +445,162 @@ function [plan,msg] = planFrontWallClimb(P,robot,map)
     end
 
     front_top = getTopLevel(map,front_v);
-    wall_v = findFrontWallVoxel(front_v,heading,map,front_top);
-    if(isempty(wall_v))
+    wall_vs = findFrontWallVoxels(front_v,heading,map,front_top);
+    if(isempty(wall_vs))
         msg = "No climbable wall footprint was found in front of the robot.";
         return;
     end
 
-    wall_levels = getColumnLevels(map,wall_v);
-
     foot_half_span = 0.5*P;
     wall_clearance = foot_half_span + 1e-3;
     [front_start,back_start,hand_ori] = unpackState7(robot.state);
-    [wall_xy,wall_n] = wallFaceAnchor(P,wall_v,heading,wall_clearance,front_start);
-    pairs = buildWallFootholdCandidates(front_top,wall_levels);
-    if(isempty(pairs))
-        msg = "No wall level is high enough for front foot to target the higher face.";
-        return;
-    end
 
     seg_samples = 6;
-    reach_max = 2*robot.a1*0.99;
+    reach_max = maxReachDistance(robot.a1);
     n_up = [0,0,1];
-    n_wall = wall_n(:)'/max(norm(wall_n),1e-9);
     anchor_joint_1 = back_start + robot.a2*n_up;
+
+    % Optional deterministic target requested by user:
+    %   front foot -> voxel (5,7,2), face normal (0,-1,0)
+    %   back foot  -> voxel (5,7,1), face normal (0,-1,0)
+    force_target.enabled = true;
+    force_target.only = false;
+    force_target.wall_v = [5,7];
+    force_target.levels = [2,1]; % [front_level, back_level]
 
     found = false;
     last_msg = "";
-    for pi = 1:size(pairs,1)
-        front_level = pairs(pi,1);
-        back_level = pairs(pi,2);
-        front_target_c = [wall_xy,(front_level-0.5)*P];
-        back_target_c = [wall_xy,(back_level-0.5)*P];
+    for wi = 1:size(wall_vs,1)
+        wall_v_c = wall_vs(wi,:);
+        wall_levels = getColumnLevels(map,wall_v_c);
+        force_wall = force_target.enabled && all(wall_v_c==force_target.wall_v) && all(heading==[0,1]);
+        if(force_wall)
+            % Center seed on voxel i-index so forced target clearly belongs to voxel (5,7,*)
+            force_seed = [(wall_v_c(1)-0.5)*P,(wall_v_c(2)-0.5)*P,front_start(3)];
+            [wall_xy,wall_n] = wallFaceAnchor(P,wall_v_c,heading,wall_clearance,force_seed);
+        else
+            [wall_xy,wall_n] = wallFaceAnchor(P,wall_v_c,heading,wall_clearance,front_start);
+        end
+        n_wall = wall_n(:)'/max(norm(wall_n),1e-9);
 
-        front_joint = front_target_c + robot.a2*n_wall;
-        back_joint = back_target_c + robot.a2*n_wall;
-        if(norm(front_joint-anchor_joint_1)>reach_max || norm(back_joint-front_joint)>reach_max)
-            continue;
+        pairs_forced = zeros(0,2);
+        if(force_wall)
+            lvl = force_target.levels;
+            if(ismember(lvl(1),wall_levels) && ismember(lvl(2),wall_levels))
+                pairs_forced = lvl;
+            end
+        end
+        pairs_hi = buildWallFootholdCandidates(front_top,wall_levels,false);
+        pairs_lo = buildWallFootholdCandidates(front_top,wall_levels,true);
+        if(force_wall && force_target.only)
+            pair_sets = {pairs_forced};
+        else
+            pair_sets = {pairs_forced,pairs_hi,pairs_lo};
         end
 
-        front_path_c = buildWallApproachPath(back_start,[0,0,1],front_start,front_target_c,...
-            heading,wall_n,P,robot.a1,robot.a2,seg_samples);
-        back_path_c = buildBackWallApproachPath(front_target_c,wall_n,back_start,back_target_c,...
-            heading,wall_n,P,robot.a1,robot.a2,seg_samples);
-        if(isempty(front_path_c) || isempty(back_path_c))
-            continue;
+        for si = 1:numel(pair_sets)
+            pairs = pair_sets{si};
+            if(isempty(pairs))
+                last_msg = sprintf("wall (%d,%d): no foothold pairs in mode %d.",...
+                    wall_v_c(1),wall_v_c(2),si);
+                continue;
+            end
+
+            for pi = 1:size(pairs,1)
+                front_level = pairs(pi,1);
+                back_level = pairs(pi,2);
+                front_target_c = [wall_xy,(front_level-0.5)*P];
+                back_target_c = [wall_xy,(back_level-0.5)*P];
+
+                front_joint = front_target_c + robot.a2*n_wall;
+                back_joint = back_target_c + robot.a2*n_wall;
+                if(norm(front_joint-anchor_joint_1)>reach_max || norm(back_joint-front_joint)>reach_max)
+                    last_msg = sprintf("wall (%d,%d) pair (%d,%d): reach pre-check failed.",...
+                        wall_v_c(1),wall_v_c(2),front_level,back_level);
+                    continue;
+                end
+
+                front_path_c = buildWallApproachPath(back_start,[0,0,1],front_start,front_target_c,...
+                    heading,wall_n,P,robot.a1,robot.a2,seg_samples);
+                back_path_c = buildBackWallApproachPath(front_target_c,wall_n,back_start,back_target_c,...
+                    heading,wall_n,P,robot.a1,robot.a2,seg_samples);
+                if(isempty(front_path_c) || isempty(back_path_c))
+                    last_msg = sprintf("wall (%d,%d) pair (%d,%d): no path candidate.",...
+                        wall_v_c(1),wall_v_c(2),front_level,back_level);
+                    continue;
+                end
+
+                front_n_path_c = buildFootNormalPath(front_path_c,wall_n);
+                back_n_path_c = buildFootNormalPath(back_path_c,wall_n);
+
+                [ths_1_c,ok,msg_1] = footPathToAnglesWithNormals(robot.a1,robot.a2,robot.pose(2),...
+                    back_start,[0,0,1],front_path_c,front_n_path_c,0);
+                if(~ok)
+                    last_msg = "front IK failed: " + msg_1;
+                    continue;
+                end
+
+                base_yaw_2 = boundedAngle(robot.pose(6)+ths_1_c(1,end));
+                [ths_2_c,ok,msg_2] = footPathToAnglesWithNormals(robot.a1,robot.a2,base_yaw_2,...
+                    front_target_c,wall_n,back_path_c,back_n_path_c,1);
+                if(~ok)
+                    last_msg = "back IK failed: " + msg_2;
+                    continue;
+                end
+
+                n_motion_c = max(size(ths_1_c,2),size(ths_2_c,2));
+                ths_c = zeros(6,n_motion_c,2);
+                ths_c(:,:,1) = resampleAngleSequence(ths_1_c,n_motion_c);
+                ths_c(:,:,2) = resampleAngleSequence(ths_2_c,n_motion_c);
+                [payload_safe_hand,hand_candidates] = plannerHandAnglePolicy(robot);
+                ths_c(6,:,:) = payload_safe_hand;
+                foot_n_traj_c = buildFootNormalTrajectory(front_n_path_c,back_n_path_c,wall_n,n_motion_c);
+
+                % Payload-safe pre-lift/pre-rotate profile candidates.
+                % Try safer hand angles first before rejecting this foothold pair.
+                ok_col = false;
+                msg_col = "";
+                ths_best = ths_c;
+                for hc = 1:numel(hand_candidates)
+                    ths_try = applyPayloadSafeHandProfile(ths_c,hand_candidates(hc));
+                    [ok_col,msg_col] = isTrajectoryCollisionFree(P,map,robot,ths_try,foot_n_traj_c);
+                    if(ok_col)
+                        ths_best = ths_try;
+                        break;
+                    end
+                end
+                if(~ok_col)
+                    last_msg = "Collision rejected: " + msg_col;
+                    continue;
+                end
+
+                found = true;
+                wall_v = wall_v_c;
+                front_target = front_target_c;
+                back_target = back_target_c;
+                front_path = front_path_c;
+                back_path = back_path_c;
+                ths = ths_best;
+                foot_n_traj = foot_n_traj_c;
+                break;
+            end
+
+            if(found)
+                break;
+            end
         end
 
-        front_n_path_c = buildFootNormalPath(front_path_c,wall_n);
-        back_n_path_c = buildFootNormalPath(back_path_c,wall_n);
-
-        [ths_1_c,ok,msg_1] = footPathToAnglesWithNormals(robot.a1,robot.a2,robot.pose(2),...
-            back_start,[0,0,1],front_path_c,front_n_path_c,0);
-        if(~ok)
-            last_msg = msg_1;
-            continue;
+        if(found)
+            break;
         end
-
-        base_yaw_2 = boundedAngle(robot.pose(6)+ths_1_c(1,end));
-        [ths_2_c,ok,msg_2] = footPathToAnglesWithNormals(robot.a1,robot.a2,base_yaw_2,...
-            front_target_c,wall_n,back_path_c,back_n_path_c,1);
-        if(~ok)
-            last_msg = msg_2;
-            continue;
-        end
-
-        found = true;
-        front_target = front_target_c;
-        back_target = back_target_c;
-        front_path = front_path_c;
-        back_path = back_path_c;
-        front_n_path = front_n_path_c;
-        back_n_path = back_n_path_c;
-        ths_1 = ths_1_c;
-        ths_2 = ths_2_c;
-        break;
     end
 
     if(~found)
-        msg = "No feasible wall-climb trajectory found for the higher wall face.";
+        msg = "No feasible collision-free wall-climb trajectory found for walls ahead.";
         if(strlength(last_msg)>0)
             msg = msg + " " + last_msg;
         end
         return;
-    end
-
-    n_motion = max(size(ths_1,2),size(ths_2,2));
-    ths = zeros(6,n_motion,2);
-    ths(:,:,1) = resampleAngleSequence(ths_1,n_motion);
-    ths(:,:,2) = resampleAngleSequence(ths_2,n_motion);
-    ths(6,:,:) = 110;
-
-    front_n_seq = resampleVectorSequence(front_n_path,n_motion);
-    back_n_seq = resampleVectorSequence(back_n_path,n_motion);
-    foot_n_traj = zeros(2,3,n_motion,2);
-    for i = 1:n_motion
-        foot_n_traj(:,:,i,1) = [0,0,1;front_n_seq(i,:)];
-        foot_n_traj(:,:,i,2) = [back_n_seq(i,:);wall_n];
     end
 
     state_target = packState7(front_target,back_target,hand_ori);
@@ -527,13 +611,12 @@ function [plan,msg] = planFrontWallClimb(P,robot,map)
         'state_target',state_target);
 end
 
-function wall_v = findFrontWallVoxel(front_v,heading,map,front_top)
-    wall_v = [];
+function wall_vs = findFrontWallVoxels(front_v,heading,map,front_top)
+    wall_vs = [];
     probe = front_v+heading;
     while(probe(1)>=1 && probe(1)<=size(map,1) && probe(2)>=1 && probe(2)<=size(map,2))
         if(getTopLevel(map,probe)>front_top)
-            wall_v = probe;
-            return;
+            wall_vs = [wall_vs;probe]; %#ok<AGROW>
         end
         probe = probe+heading;
     end
@@ -553,24 +636,45 @@ function top = getTopLevel(map,v)
     end
 end
 
-function pairs = buildWallFootholdCandidates(front_top,wall_levels)
-    wall_levels = sort(unique(wall_levels(:)'),'ascend');
-    move_levels = wall_levels(wall_levels>=front_top+1);
-    front_levels = move_levels(move_levels>=front_top+2);
+function pairs = buildWallFootholdCandidates(front_top,wall_levels,allow_lower_front)
+    if(nargin<3)
+        allow_lower_front = false;
+    end
 
-    pairs = [];
-    preferred = [front_top+2,front_top+1];
-    if(ismember(preferred(1),front_levels) && ismember(preferred(2),move_levels))
-        pairs = preferred;
-        return;
+    wall_levels = sort(unique(wall_levels(:)'),'ascend');
+    if(allow_lower_front)
+        front_levels = wall_levels(wall_levels>=front_top+1);
+        back_pool = wall_levels(wall_levels>=front_top);
+        preferred_list = [front_top+1,front_top;...
+            front_top+1,front_top+1;...
+            front_top+2,front_top+1];
+    else
+        move_levels = wall_levels(wall_levels>=front_top+1);
+        front_levels = move_levels(move_levels>=front_top+2);
+        back_pool = move_levels;
+        preferred_list = [front_top+2,front_top+1];
+    end
+
+    pairs = zeros(0,2);
+    for i = 1:size(preferred_list,1)
+        preferred = preferred_list(i,:);
+        if(ismember(preferred(1),front_levels) && ismember(preferred(2),back_pool))
+            if(isempty(pairs) || ~ismember(preferred,pairs,'rows'))
+                pairs = [pairs;preferred]; %#ok<AGROW>
+            end
+        end
     end
 
     for fi = numel(front_levels):-1:1
         front_level = front_levels(fi);
-        back_options = move_levels(move_levels<front_level);
+        if(allow_lower_front)
+            back_options = back_pool(back_pool<=front_level);
+        else
+            back_options = back_pool(back_pool<front_level);
+        end
         for bi = numel(back_options):-1:1
             cand = [front_level,back_options(bi)];
-            if(~ismember(cand,pairs,'rows'))
+            if(isempty(pairs) || ~ismember(cand,pairs,'rows'))
                 pairs = [pairs;cand]; %#ok<AGROW>
             end
         end
@@ -621,7 +725,7 @@ function [front_target,back_target,msg] = chooseWallFootholds(P,a1,a2,back_start
         return;
     end
 
-    reach_max = 2*a1*0.99;
+    reach_max = maxReachDistance(a1);
     n_up = [0,0,1];
     n_wall = wall_n(:)'/max(norm(wall_n),1e-9);
     anchor_joint_1 = back_start + a2*n_up;
@@ -669,7 +773,9 @@ function path = buildWallApproachPath(anchor_pt,anchor_n,start_pt,target_pt,head
     heading = heading/norm(heading);
 
     safe_z = computeSafeZ(anchor_pt,start_pt,target_pt,P,a1);
-    approach_scan = [0.75,0.5,0.25,0.0]*P;
+    % Payload-aware extra lift before moving toward wall.
+    safe_z = min(safe_z + 0.5*P,target_pt(3)+1.5*P);
+    approach_scan = [2.0,1.75,1.5,1.25,1.0,0.75,0.5,0.25,0.0]*P;
     path = [];
     for i = 1:numel(approach_scan)
         pre_xy = target_pt(1:2)-approach_scan(i)*heading;
@@ -713,8 +819,8 @@ function path = buildBackWallApproachPath(anchor_pt,anchor_n,start_pt,target_pt,
     end
     heading = heading/norm(heading);
 
-    approach_scan = [0.75,0.5,0.25,0.0]*P;
-    lift_scan = [0.35,0.5,0.25]*P;
+    approach_scan = [2.0,1.75,1.5,1.25,1.0,0.75,0.5,0.25,0.0]*P;
+    lift_scan = [0.75,0.6,0.45,0.3]*P;
     path = [];
     for i = 1:numel(approach_scan)
         pre_xy = target_pt(1:2)-approach_scan(i)*heading;
@@ -792,7 +898,8 @@ function safe_z = computeSafeZ(anchor_pt,start_pt,target_pt,P,a1)
     xy_1 = norm(start_pt(1:2)-anchor_pt(1:2));
     xy_2 = norm(target_pt(1:2)-anchor_pt(1:2));
     xy_max = max([xy_1,xy_2]);
-    max_dz = sqrt(max((2*a1)^2-xy_max^2,0));
+    reach_max = maxReachDistance(a1);
+    max_dz = sqrt(max(reach_max^2-xy_max^2,0));
 
     safe_z_nom = max(start_pt(3),target_pt(3))+P;
     safe_z_max = anchor_pt(3)+0.95*max_dz;
@@ -801,12 +908,14 @@ function safe_z = computeSafeZ(anchor_pt,start_pt,target_pt,P,a1)
 end
 
 function ok = pathWithinReach(anchor_pt,path_pts,a1)
+    reach_max = maxReachDistance(a1);
     d = path_pts-anchor_pt;
     dist = sqrt(sum(d.^2,2));
-    ok = all((dist<2*a1*0.999) & (dist>1e-6));
+    ok = all((dist<reach_max) & (dist>1e-6));
 end
 
 function ok = pathWithinReachWithNormals(anchor_contact,anchor_n,path_pts,path_n,a1,a2)
+    reach_max = maxReachDistance(a1);
     anchor_n = anchor_n(:)'/max(norm(anchor_n),1e-9);
     anchor_joint = anchor_contact + a2*anchor_n;
     ok = true;
@@ -814,7 +923,7 @@ function ok = pathWithinReachWithNormals(anchor_contact,anchor_n,path_pts,path_n
         n = path_n(i,:)/max(norm(path_n(i,:)),1e-9);
         joint = path_pts(i,:) + a2*n;
         b = norm(joint-anchor_joint);
-        if(b>=2*a1*0.999 || b<1e-6)
+        if(b>=reach_max || b<1e-6)
             ok = false;
             return;
         end
@@ -870,6 +979,241 @@ function out = resampleVectorSequence(in,n_out)
     out = normalizeRows(out);
 end
 
+function foot_n_traj = buildFootNormalTrajectory(front_n_path,back_n_path,wall_n,n_motion)
+    front_n_seq = resampleVectorSequence(front_n_path,n_motion);
+    back_n_seq = resampleVectorSequence(back_n_path,n_motion);
+    foot_n_traj = zeros(2,3,n_motion,2);
+    for i = 1:n_motion
+        foot_n_traj(:,:,i,1) = [0,0,1;front_n_seq(i,:)];
+        foot_n_traj(:,:,i,2) = [back_n_seq(i,:);wall_n];
+    end
+end
+
+function ths_out = applyPayloadSafeHandProfile(ths_in,safe_h)
+    ths_out = ths_in;
+    if(isempty(ths_in) || size(ths_in,2)<2)
+        return;
+    end
+
+    base_h = ths_in(6,1,1);
+    n = size(ths_in,2);
+    prep = min(6,max(2,round(0.2*n)));
+
+    % Dedicated pre-lift/pre-rotate: hold body/foot trajectory briefly,
+    % rotate payload hand to a safer attitude before wall engagement.
+    base_col = ths_in(:,1,1);
+    for j = 1:prep
+        a = (j-1)/max(prep-1,1);
+        ths_out(1:5,j,1) = base_col(1:5);
+        ths_out(6,j,1) = (1-a)*base_h + a*safe_h;
+    end
+    if(prep<n)
+        ths_out(6,prep+1:end,1) = safe_h;
+    end
+
+    for j = 1:n
+        a = (j-1)/max(n-1,1);
+        ths_out(6,j,2) = (1-a)*safe_h + a*base_h;
+    end
+end
+
+function [ok,msg] = isTrajectoryCollisionFree(P,map,robot0,ths,foot_n_traj)
+    ok = true;
+    msg = "";
+    occ = occupiedVoxelBoxes(map,P);
+    if(isempty(occ))
+        return;
+    end
+
+    sim = robot0;
+
+    for k = 1:size(ths,3)
+        sim.ths = ths(:,:,k);
+        for j = 1:size(ths,2)
+            if(~isempty(foot_n_traj))
+                nframes = size(foot_n_traj,3);
+                jn = min(j,nframes);
+                sim.foot_n = foot_n_traj(:,:,jn,k);
+            end
+            sim.th_ind = j;
+            sim = updatePoseD(sim);
+            sim = moveRobot(sim);
+
+            % Allow planner to start from current configuration and enforce
+            % collision-free motion after the very first sample.
+            if(k==1 && j==1)
+                continue;
+            end
+            [hit,detail] = robotPayloadCollision(sim,occ,P);
+            if(hit)
+                ok = false;
+                msg = sprintf("phase %d step %d: %s",k,j,detail);
+                return;
+            end
+        end
+        sim.anchor = ~sim.anchor;
+        sim.pose = sim.pose_d;
+    end
+end
+
+function [robot,msg] = setInitialPayloadHandSafe(P,map,robot,angle_candidates)
+    msg = "";
+    if(~isfield(robot,'payload') || ~robot.payload)
+        return;
+    end
+    if(nargin<4 || isempty(angle_candidates))
+        angle_candidates = [0,20,40,55,70,90,110];
+    end
+
+    occ = occupiedVoxelBoxes(map,P);
+    if(isempty(occ))
+        return;
+    end
+
+    best_angle = robot.ths(6);
+    best_clear = -inf;
+    for i = 1:numel(angle_candidates)
+        a = angle_candidates(i);
+        robot_try = robot;
+        robot_try.ths(6) = a;
+        [hit,~] = robotPayloadCollision(robot_try,occ,P);
+        clear_now = payloadClearance(robot_try,occ,P);
+
+        if(~hit)
+            robot.ths(6) = a;
+            msg = sprintf("Initial payload angle auto-set to %.1f deg (collision-free).",a);
+            return;
+        end
+
+        if(clear_now>best_clear)
+            best_clear = clear_now;
+            best_angle = a;
+        end
+    end
+
+    robot.ths(6) = best_angle;
+    msg = sprintf("No collision-free initial payload angle found; using best-clearance angle %.1f deg.",...
+        best_angle);
+end
+
+function occ = occupiedVoxelBoxes(map,P)
+    idx = find(map>0);
+    if(isempty(idx))
+        occ = zeros(0,6);
+        return;
+    end
+    [ii,jj,kk] = ind2sub(size(map),idx);
+    occ = [(ii-1)*P,ii*P,(jj-1)*P,jj*P,(kk-1)*P,kk*P];
+end
+
+function [hit,detail] = robotPayloadCollision(robot,occ,P)
+    hit = false;
+    detail = "";
+    if(isempty(robot.coord) || size(robot.coord,2)<5)
+        return;
+    end
+
+    % v1 policy: prioritize payload-vs-environment collision.
+    % Body-link collision in this simulator frame can create many false positives.
+    check_body = false;
+    if(check_body)
+        link_r = 0.08*P;
+        joint_r = 0.16*P;
+        c = robot.coord';
+        joints = c(3,:);
+        for i = 1:size(joints,1)
+            if(sphereHitsOccupied(joints(i,:),joint_r,occ))
+                hit = true;
+                detail = "joint intersects occupied voxel";
+                return;
+            end
+        end
+
+        segs = [2,3;3,4];
+        for i = 1:size(segs,1)
+            p0 = c(segs(i,1),:);
+            p1 = c(segs(i,2),:);
+            if(segmentHitsOccupied(p0,p1,link_r,occ))
+                hit = true;
+                detail = "link sweep intersects occupied voxel";
+                return;
+            end
+        end
+    end
+
+    if(isfield(robot,'payload') && robot.payload)
+        th_h = 110;
+        if(isfield(robot,'ths') && ~isempty(robot.ths) && size(robot.ths,1)>=6)
+            th_h = robot.ths(6);
+        end
+        c_payload = payloadCenterApprox(P,robot.coord,robot.pose_d,th_h);
+        r_payload = 0.45*P;
+        if(sphereHitsOccupied(c_payload,r_payload,occ))
+            hit = true;
+            detail = "payload intersects occupied voxel";
+            return;
+        end
+    end
+end
+
+function dmin = payloadClearance(robot,occ,P)
+    if(isempty(occ) || isempty(robot.coord) || size(robot.coord,2)<5)
+        dmin = inf;
+        return;
+    end
+
+    th_h = 110;
+    if(isfield(robot,'ths') && ~isempty(robot.ths) && size(robot.ths,1)>=6)
+        th_h = robot.ths(6);
+    end
+
+    c_payload = payloadCenterApprox(P,robot.coord,robot.pose_d,th_h);
+    r_payload = 0.45*P;
+
+    dx = max(max(occ(:,1)-c_payload(1),0),c_payload(1)-occ(:,2));
+    dy = max(max(occ(:,3)-c_payload(2),0),c_payload(2)-occ(:,4));
+    dz = max(max(occ(:,5)-c_payload(3),0),c_payload(3)-occ(:,6));
+    d_box = sqrt(dx.^2 + dy.^2 + dz.^2);
+    dmin = min(d_box)-r_payload;
+end
+
+function tf = segmentHitsOccupied(p0,p1,r,occ)
+    d = norm(p1-p0);
+    n = max(2,ceil(d/max(r,1e-6))+1);
+    s = linspace(0,1,n)';
+    tf = false;
+    for i = 1:n
+        c = p0 + s(i)*(p1-p0);
+        if(sphereHitsOccupied(c,r,occ))
+            tf = true;
+            return;
+        end
+    end
+end
+
+function tf = sphereHitsOccupied(c,r,occ)
+    dx = max(max(occ(:,1)-c(1),0),c(1)-occ(:,2));
+    dy = max(max(occ(:,3)-c(2),0),c(2)-occ(:,4));
+    dz = max(max(occ(:,5)-c(3),0),c(3)-occ(:,6));
+    d2 = dx.^2 + dy.^2 + dz.^2;
+    tf = any(d2 <= r^2);
+end
+
+function c_payload = payloadCenterApprox(P,coord,pose_d,th_h)
+    if(isempty(pose_d))
+        c_payload = coord(:,5)';
+        return;
+    end
+
+    th6 = boundedAngle(-pose_d(7)+180);
+    RotZ2h = [cosd(th6),-sind(th6),0;sind(th6),cosd(th6),0;0,0,1];
+    RotH = [cosd(th_h),0,sind(th_h);0,1,0;-sind(th_h),0,cosd(th_h)];
+
+    local_center = [1.15,0.50,0.38]*P;
+    ofs = coord(:,5)' + [0.35*P,0,0.12*P]*RotZ2h;
+    c_payload = local_center*RotH*RotZ2h + ofs;
+end
+
 function pts = interpolateWaypoints(waypoints,samples_per_segment)
     pts = waypoints(1,:);
     for i = 1:size(waypoints,1)-1
@@ -884,16 +1228,17 @@ function [ths_phase,ok,msg] = footPathToAngles(a1,base_yaw,anchor_pt,path_pts)
     msg = "";
     n = size(path_pts,1);
     ths_phase = zeros(6,n);
+    reach_max = maxReachDistance(a1);
 
     for i = 1:n
         d = path_pts(i,:)-anchor_pt;
         xy = norm(d(1:2));
         b = norm(d);
 
-        if(b<1e-6 || b>(2*a1))
+        if(b<1e-6 || b>reach_max)
             ok = false;
             msg = sprintf("Planned footprint path unreachable at point %d (dist=%.3f, max=%.3f).",...
-                i,b,2*a1);
+                i,b,reach_max);
             return;
         end
 
@@ -923,6 +1268,7 @@ function [ths_phase,ok,msg] = footPathToAnglesWithNormals(a1,a2,base_yaw,...
     msg = "";
     n = size(path_pts,1);
     ths_phase = zeros(6,n);
+    reach_max = maxReachDistance(a1);
 
     anchor_n = anchor_n(:)'/max(norm(anchor_n),1e-9);
     anchor_joint = anchor_contact + a2*anchor_n;
@@ -934,10 +1280,10 @@ function [ths_phase,ok,msg] = footPathToAnglesWithNormals(a1,a2,base_yaw,...
         xy = norm(d(1:2));
         b = norm(d);
 
-        if(b<1e-6 || b>(2*a1))
+        if(b<1e-6 || b>reach_max)
             ok = false;
             msg = sprintf("Planned footprint path unreachable at point %d (dist=%.3f, max=%.3f).",...
-                i,b,2*a1);
+                i,b,reach_max);
             return;
         end
 
@@ -1378,6 +1724,48 @@ function a = wrapAngle360Deg(a)
     if(a<0)
         a = a+360;
     end
+end
+
+function [has_override,angle] = parseOptionalHandAngle(hand_in)
+    has_override = false;
+    angle = 0;
+
+    if(isempty(hand_in))
+        return;
+    end
+
+    txt = strtrim(string(hand_in));
+    if(strlength(txt)==0 || strcmpi(txt,"auto"))
+        return;
+    end
+
+    val = str2double(txt);
+    if(~isfinite(val))
+        warning('Invalid hand angle input "%s". Falling back to auto mode.',txt);
+        return;
+    end
+
+    has_override = true;
+    angle = boundedAngle(val);
+end
+
+function [safe_h,hand_candidates] = plannerHandAnglePolicy(robot)
+    default_scan = [20,0,-20,40,55,70,90,110];
+    safe_h = 70;
+    if(isfield(robot,'hand_pref') && ~isempty(robot.hand_pref) && isfinite(robot.hand_pref))
+        safe_h = boundedAngle(robot.hand_pref);
+    end
+
+    if(isfield(robot,'hand_lock') && robot.hand_lock)
+        hand_candidates = safe_h;
+    else
+        hand_candidates = unique([safe_h,default_scan],'stable');
+    end
+end
+
+function reach_max = maxReachDistance(a1)
+    % Single source of truth for kinematic reach bound.
+    reach_max = 2*a1*0.999;
 end
 
 function v = clampScalar(v,vmin,vmax)
